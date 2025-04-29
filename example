@@ -1,162 +1,144 @@
 from time import sleep
 import robot_module as robot
-import matplotlib
-matplotlib.use('Agg')  # Set non-interactive backend
 import matplotlib.pyplot as plt
-from matplotlib import animation
-from collections import deque
-import time
+import numpy as np
 import threading
-import os
-from datetime import datetime
+import math
+from collections import deque
 
 # Initialize Sensors
 robot.MPU_Init()
 ads = robot.ADS7830()
 
-safe_distance = 20  # cm
+# Setup interactive mode
+plt.ion()  # Turn on interactive mode
+fig = plt.figure(figsize=(12, 6))
 
-# Create output directory
-os.makedirs('visualizations', exist_ok=True)
+# Subplot 1: Distance vs Time
+ax1 = fig.add_subplot(1, 2, 1)
+time_buffer = deque(maxlen=100)
+distance_buffer = deque(maxlen=100)
+line, = ax1.plot([], [], 'b-')
+ax1.set_title("Ultrasonic Distance (Live)")
+ax1.set_xlabel("Time (s)")
+ax1.set_ylabel("Distance (cm)")
+ax1.set_ylim(0, 100)
+ax1.grid(True)
 
-# Data buffers
-time_buffer = deque()
-distance_buffer = deque()
+# Subplot 2: Room Map
+ax2 = fig.add_subplot(1, 2, 2)
+ax2.set_title("Room Map (Live)")
+ax2.set_xlim(-200, 200)
+ax2.set_ylim(-200, 200)
+ax2.set_aspect('equal')
+ax2.grid(True)
+
+# Robot position tracking
+robot_x, robot_y = 0, 0
+robot_theta = 0  # Facing right (0 degrees)
+robot_trail = deque(maxlen=100)  # Store past positions
+robot_arrow = ax2.arrow(0, 0, 10, 0, head_width=10, head_length=15, fc='r', ec='r')
+obstacles = []
+
+# Shared variables
+distance = 0
+running = True
 start_time = time.time()
 
-# Global variables shared between threads
-distance = 0
-Ax = Ay = Az = 0
-plot_update_flag = False
-running = True
-
-class RobotVisualizer:
-    def __init__(self):
-        # Setup the plot
-        self.fig = plt.figure(figsize=(12, 6))
-        
-        # Subplot 1: Distance vs Time
-        self.ax1 = self.fig.add_subplot(1, 2, 1)
-        self.line, = self.ax1.plot([], [], lw=2)
-        self.ax1.set_title("Ultrasonic Distance (Last 5 sec)")
-        self.ax1.set_xlabel("Time (s)")
-        self.ax1.set_ylabel("Distance (cm)")
-        self.ax1.set_ylim(0, 100)
-        
-        # Subplot 2: 3D Orientation
-        self.ax2 = self.fig.add_subplot(1, 2, 2, projection='3d')
-        self.ax2.set_title("MPU6050 Orientation")
-        
-        self.last_save_time = time.time()
-        
-    def update_plot(self):
-        global Ax, Ay, Az, distance, plot_update_flag
-        
-        current_time = time.time() - start_time
-        
-        time_buffer.append(current_time)
-        distance_buffer.append(distance)
-        
-        # Keep last 5 seconds
-        while time_buffer and (current_time - time_buffer[0]) > 5:
-            time_buffer.popleft()
-            distance_buffer.popleft()
-        
-        # Update distance subplot
-        self.line.set_data(time_buffer, distance_buffer)
-        self.ax1.set_xlim(max(0, current_time - 5), current_time)
-        self.ax1.set_ylim(0, max(50, max(distance_buffer) + 10))
-        
-        # Update orientation subplot
-        self.ax2.cla()
-        self.ax2.set_title("MPU6050 Orientation")
-        self.ax2.quiver(0, 0, 0, Ax, Ay, Az, length=1, color='r', normalize=True)
-        self.ax2.set_xlim([-1, 1])
-        self.ax2.set_ylim([-1, 1])
-        self.ax2.set_zlim([-1, 1])
-        self.ax2.set_xlabel('X')
-        self.ax2.set_ylabel('Y')
-        self.ax2.set_zlabel('Z')
-        
-        # Save plot periodically (every 1 second)
-        if time.time() - self.last_save_time > 1.0:
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            filename = f"visualizations/robot_vis_{timestamp}.png"
-            plt.tight_layout()
-            self.fig.savefig(filename, dpi=100)
-            print(f"Saved visualization to {filename}")
-            self.last_save_time = time.time()
-            
-        plot_update_flag = False
+def update_plots():
+    global robot_x, robot_y, robot_theta, robot_arrow
+    
+    # Update distance plot
+    current_time = time.time() - start_time
+    time_buffer.append(current_time)
+    distance_buffer.append(distance)
+    line.set_data(time_buffer, distance_buffer)
+    ax1.set_xlim(max(0, current_time-5), current_time)
+    
+    # Update room map
+    robot_trail.append((robot_x, robot_y))
+    
+    # Clear and redraw map
+    ax2.clear()
+    ax2.set_title("Room Map (Live)")
+    ax2.set_xlim(-200, 200)
+    ax2.set_ylim(-200, 200)
+    ax2.grid(True)
+    
+    # Draw robot trail
+    if len(robot_trail) > 1:
+        trail_x, trail_y = zip(*robot_trail)
+        ax2.plot(trail_x, trail_y, 'g-', alpha=0.5)
+    
+    # Draw robot (as arrow)
+    arrow_length = 20
+    end_x = robot_x + arrow_length * math.cos(math.radians(robot_theta))
+    end_y = robot_y + arrow_length * math.sin(math.radians(robot_theta))
+    ax2.arrow(robot_x, robot_y, 
+              end_x-robot_x, end_y-robot_y, 
+              head_width=10, head_length=15, fc='r', ec='r')
+    
+    # Draw obstacles
+    if distance < 100:  # Only plot if obstacle is within 100cm
+        obstacle_x = robot_x + distance * math.cos(math.radians(robot_theta))
+        obstacle_y = robot_y + distance * math.sin(math.radians(robot_theta))
+        ax2.plot(obstacle_x, obstacle_y, 'ro')
+    
+    # Redraw
+    fig.canvas.draw()
+    fig.canvas.flush_events()
 
 def sensor_loop():
-    global Ax, Ay, Az, distance, plot_update_flag, running
+    global robot_x, robot_y, robot_theta, distance, running
     
     try:
         while running:
+            # Get sensor data
             distance = robot.get_distance()
             print(f"Distance: {distance} cm")
-
+            
+            # Get orientation (simplified)
             acc_x = robot.read_raw_data(robot.ACCEL_XOUT_H)
             acc_y = robot.read_raw_data(robot.ACCEL_YOUT_H)
             acc_z = robot.read_raw_data(robot.ACCEL_ZOUT_H)
-
-            Ax = acc_x / 16384.0
-            Ay = acc_y / 16384.0
-            Az = acc_z / 16384.0
-
-            print(f"Accelerometer: Ax={Ax:.2f}g Ay={Ay:.2f}g Az={Az:.2f}g")
-
+            
+            # Simple movement simulation
             adc0 = ads.read_adc(0)
             adc1 = ads.read_adc(1)
-            print(f"ADC0: {adc0}, ADC1: {adc1}")
-
+            
             if adc0 > 240:
                 robot.forward()
                 print("Moving Forward")
+                # Update position based on movement
+                move_distance = 5  # cm per step
+                robot_x += move_distance * math.cos(math.radians(robot_theta))
+                robot_y += move_distance * math.sin(math.radians(robot_theta))
             else:
                 robot.stop()
-
-            plot_update_flag = True
-            sleep(1)
+                # Simulate turning
+                robot_theta = (robot_theta + 5) % 360
+            
+            update_plots()
+            sleep(0.1)
+            
     except KeyboardInterrupt:
         print("Sensor loop interrupted.")
         running = False
         robot.stop()
         robot.cleanup()
 
-def visualization_loop(visualizer):
-    global running
-    
-    try:
-        while running:
-            if plot_update_flag:
-                visualizer.update_plot()
-            time.sleep(0.1)
-    except KeyboardInterrupt:
-        print("Visualization loop interrupted.")
-        running = False
+# Start sensor thread
+sensor_thread = threading.Thread(target=sensor_loop)
+sensor_thread.daemon = True
+sensor_thread.start()
 
-if __name__ == "__main__":
-    visualizer = RobotVisualizer()
-    
-    # Start sensor thread
-    sensor_thread = threading.Thread(target=sensor_loop)
-    sensor_thread.daemon = True
-    sensor_thread.start()
-    
-    # Start visualization thread
-    vis_thread = threading.Thread(target=visualization_loop, args=(visualizer,))
-    vis_thread.daemon = True
-    vis_thread.start()
-    
-    try:
-        while running:
-            time.sleep(0.1)
-    except KeyboardInterrupt:
-        print("Main loop interrupted.")
-        running = False
-    
+try:
+    plt.tight_layout()
+    plt.show(block=True)  # This will block until window is closed
+except KeyboardInterrupt:
+    print("Visualization interrupted.")
+finally:
+    running = False
     sensor_thread.join()
-    vis_thread.join()
+    plt.close()
     print("Program exited cleanly")

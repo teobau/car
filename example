@@ -1,200 +1,162 @@
-import numpy as np
-import matplotlib.pyplot as plt
-from heapq import heappop, heappush
+from time import sleep
 import robot_module as robot
+import matplotlib
+matplotlib.use('Agg')  # Set non-interactive backend
+import matplotlib.pyplot as plt
+from matplotlib import animation
+from collections import deque
 import time
 import threading
-from math import radians, degrees, sin, cos, atan2
+import os
+from datetime import datetime
 
-# ----------------------
-# SLAM Configuration
-# ----------------------
-MAP_SIZE = (100, 100)  # 100x100 grid (1m x 1m at 1cm resolution)
-MAP_CENTER = (50, 50)  # Start position
-OBSTACLE_VALUE = 1     # 1=obstacle, 0=free space
+# Initialize Sensors
+robot.MPU_Init()
+ads = robot.ADS7830()
 
-# Initialize occupancy grid
-occupancy_grid = np.zeros(MAP_SIZE)
-robot_pos = list(MAP_CENTER)
-robot_angle = 0  # Facing +X axis (right)
+safe_distance = 20  # cm
 
-# ----------------------
-# A* Pathfinding
-# ----------------------
-def heuristic(a, b):
-    """Euclidean distance heuristic for A*"""
-    return np.sqrt((a[0] - b[0])**2 + (a[1] - b[1])**2)
+# Create output directory
+os.makedirs('visualizations', exist_ok=True)
 
-def a_star(start, goal):
-    """A* algorithm to find shortest path"""
-    open_set = []
-    heappush(open_set, (0, start))
-    came_from = {}
-    g_score = {start: 0}
-    f_score = {start: heuristic(start, goal)}
-    
-    while open_set:
-        _, current = heappop(open_set)
-        if current == goal:
-            path = []
-            while current in came_from:
-                path.append(current)
-                current = came_from[current]
-            path.append(start)
-            return path[::-1]
+# Data buffers
+time_buffer = deque()
+distance_buffer = deque()
+start_time = time.time()
+
+# Global variables shared between threads
+distance = 0
+Ax = Ay = Az = 0
+plot_update_flag = False
+running = True
+
+class RobotVisualizer:
+    def __init__(self):
+        # Setup the plot
+        self.fig = plt.figure(figsize=(12, 6))
         
-        for neighbor in get_neighbors(current):
-            tentative_g = g_score[current] + 1
-            if neighbor not in g_score or tentative_g < g_score[neighbor]:
-                came_from[neighbor] = current
-                g_score[neighbor] = tentative_g
-                f_score[neighbor] = tentative_g + heuristic(neighbor, goal)
-                heappush(open_set, (f_score[neighbor], neighbor))
-    return []  # No path found
+        # Subplot 1: Distance vs Time
+        self.ax1 = self.fig.add_subplot(1, 2, 1)
+        self.line, = self.ax1.plot([], [], lw=2)
+        self.ax1.set_title("Ultrasonic Distance (Last 5 sec)")
+        self.ax1.set_xlabel("Time (s)")
+        self.ax1.set_ylabel("Distance (cm)")
+        self.ax1.set_ylim(0, 100)
+        
+        # Subplot 2: 3D Orientation
+        self.ax2 = self.fig.add_subplot(1, 2, 2, projection='3d')
+        self.ax2.set_title("MPU6050 Orientation")
+        
+        self.last_save_time = time.time()
+        
+    def update_plot(self):
+        global Ax, Ay, Az, distance, plot_update_flag
+        
+        current_time = time.time() - start_time
+        
+        time_buffer.append(current_time)
+        distance_buffer.append(distance)
+        
+        # Keep last 5 seconds
+        while time_buffer and (current_time - time_buffer[0]) > 5:
+            time_buffer.popleft()
+            distance_buffer.popleft()
+        
+        # Update distance subplot
+        self.line.set_data(time_buffer, distance_buffer)
+        self.ax1.set_xlim(max(0, current_time - 5), current_time)
+        self.ax1.set_ylim(0, max(50, max(distance_buffer) + 10))
+        
+        # Update orientation subplot
+        self.ax2.cla()
+        self.ax2.set_title("MPU6050 Orientation")
+        self.ax2.quiver(0, 0, 0, Ax, Ay, Az, length=1, color='r', normalize=True)
+        self.ax2.set_xlim([-1, 1])
+        self.ax2.set_ylim([-1, 1])
+        self.ax2.set_zlim([-1, 1])
+        self.ax2.set_xlabel('X')
+        self.ax2.set_ylabel('Y')
+        self.ax2.set_zlabel('Z')
+        
+        # Save plot periodically (every 1 second)
+        if time.time() - self.last_save_time > 1.0:
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f"visualizations/robot_vis_{timestamp}.png"
+            plt.tight_layout()
+            self.fig.savefig(filename, dpi=100)
+            print(f"Saved visualization to {filename}")
+            self.last_save_time = time.time()
+            
+        plot_update_flag = False
 
-def get_neighbors(pos):
-    """Get valid adjacent cells (4-directional)"""
-    x, y = pos
-    neighbors = []
-    for dx, dy in [(1,0), (-1,0), (0,1), (0,-1)]:  # 4-way connectivity
-        nx, ny = x + dx, y + dy
-        if 0 <= nx < MAP_SIZE[0] and 0 <= ny < MAP_SIZE[1]:
-            if occupancy_grid[nx, ny] != OBSTACLE_VALUE:  # Ignore obstacles
-                neighbors.append((nx, ny))
-    return neighbors
-
-# ----------------------
-# SLAM Core Functions
-# ----------------------
-def update_map(distance):
-    """Update occupancy grid with new sonar reading"""
-    global robot_pos, robot_angle
+def sensor_loop():
+    global Ax, Ay, Az, distance, plot_update_flag, running
     
-    # Calculate obstacle position (convert polar to Cartesian)
-    obstacle_x = robot_pos[0] + distance * cos(radians(robot_angle))
-    obstacle_y = robot_pos[1] + distance * sin(radians(robot_angle))
-    
-    # Mark obstacle in grid (clamp to map bounds)
-    if 0 <= obstacle_x < MAP_SIZE[0] and 0 <= obstacle_y < MAP_SIZE[1]:
-        occupancy_grid[int(obstacle_x), int(obstacle_y)] = OBSTACLE_VALUE
-
-def rotate_to_angle(target_angle):
-    """Rotate robot to target angle using IMU"""
-    global robot_angle
-    error = (target_angle - robot_angle + 180) % 360 - 180  # Shortest path
-    
-    if error > 0:
-        robot.right()
-    else:
-        robot.left()
-    
-    # Simple proportional control
-    sleep_time = abs(error) / 90  # Empirical calibration needed
-    time.sleep(sleep_time)
-    robot.stop()
-    
-    robot_angle = target_angle % 360
-
-def move_to_position(target_pos):
-    """Move robot to target grid position"""
-    global robot_pos
-    
-    # Calculate target angle
-    dx = target_pos[0] - robot_pos[0]
-    dy = target_pos[1] - robot_pos[1]
-    target_angle = degrees(atan2(dy, dx))
-    
-    # Rotate toward target
-    rotate_to_angle(target_angle)
-    
-    # Move forward (1 grid cell)
-    robot.forward()
-    time.sleep(0.5)  # Adjust based on your robot's speed
-    robot.stop()
-    
-    # Update position
-    robot_pos[0] = target_pos[0]
-    robot_pos[1] = target_pos[1]
-
-# ----------------------
-# Main Navigation Loop
-# ----------------------
-def slam_loop():
-    """Main SLAM and navigation thread"""
     try:
-        while True:
-            # 1. Scan environment (rotate 360°)
-            for _ in range(4):  # 4 x 90° = 360°
-                distance = robot.get_distance()
-                update_map(distance)
-                rotate_to_angle(robot_angle + 90)
-                time.sleep(0.1)
-            
-            # 2. Set exploration goal (frontier-based)
-            goal = find_exploration_goal()
-            if not goal:
-                print("Exploration complete!")
-                break
-            
-            # 3. Plan path with A*
-            path = a_star(tuple(robot_pos), goal)
-            if not path:
-                print("No path to goal!")
-                continue
-            
-            # 4. Follow path
-            for waypoint in path[1:]:  # Skip current position
-                move_to_position(waypoint)
-                time.sleep(0.1)
-                
+        while running:
+            distance = robot.get_distance()
+            print(f"Distance: {distance} cm")
+
+            acc_x = robot.read_raw_data(robot.ACCEL_XOUT_H)
+            acc_y = robot.read_raw_data(robot.ACCEL_YOUT_H)
+            acc_z = robot.read_raw_data(robot.ACCEL_ZOUT_H)
+
+            Ax = acc_x / 16384.0
+            Ay = acc_y / 16384.0
+            Az = acc_z / 16384.0
+
+            print(f"Accelerometer: Ax={Ax:.2f}g Ay={Ay:.2f}g Az={Az:.2f}g")
+
+            adc0 = ads.read_adc(0)
+            adc1 = ads.read_adc(1)
+            print(f"ADC0: {adc0}, ADC1: {adc1}")
+
+            if adc0 > 240:
+                robot.forward()
+                print("Moving Forward")
+            else:
+                robot.stop()
+
+            plot_update_flag = True
+            sleep(1)
     except KeyboardInterrupt:
+        print("Sensor loop interrupted.")
+        running = False
         robot.stop()
-
-def find_exploration_goal():
-    """Find nearest unexplored area (frontier detection)"""
-    for x in range(MAP_SIZE[0]):
-        for y in range(MAP_SIZE[1]):
-            if occupancy_grid[x, y] == 0:  # Free space
-                # Check if adjacent to unknown (edge of explored area)
-                for dx, dy in [(1,0), (-1,0), (0,1), (0,-1)]:
-                    nx, ny = x + dx, y + dy
-                    if 0 <= nx < MAP_SIZE[0] and 0 <= ny < MAP_SIZE[1]:
-                        if occupancy_grid[nx, ny] == 0.5:  # Unknown
-                            return (x, y)
-    return None
-
-# ----------------------
-# Visualization
-# ----------------------
-def visualize():
-    plt.ion()
-    fig, ax = plt.subplots(figsize=(10, 10))
-    
-    while True:
-        ax.clear()
-        ax.imshow(occupancy_grid.T, origin='lower', cmap='binary')
-        ax.scatter(robot_pos[0], robot_pos[1], c='red', s=100, label='Robot')
-        ax.set_title("SLAM Map (Red = Robot)")
-        ax.legend()
-        plt.pause(0.1)
-
-# ----------------------
-# Execution
-# ----------------------
-if __name__ == "__main__":
-    try:
-        # Initialize hardware
-        robot.MPU_Init()
-        robot.set_speed(50)
-        
-        # Start visualization thread
-        vis_thread = threading.Thread(target=visualize, daemon=True)
-        vis_thread.start()
-        
-        # Run SLAM
-        slam_loop()
-        
-    finally:
         robot.cleanup()
-        plt.savefig('final_map.png')
-        print("Map saved to final_map.png")
+
+def visualization_loop(visualizer):
+    global running
+    
+    try:
+        while running:
+            if plot_update_flag:
+                visualizer.update_plot()
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        print("Visualization loop interrupted.")
+        running = False
+
+if __name__ == "__main__":
+    visualizer = RobotVisualizer()
+    
+    # Start sensor thread
+    sensor_thread = threading.Thread(target=sensor_loop)
+    sensor_thread.daemon = True
+    sensor_thread.start()
+    
+    # Start visualization thread
+    vis_thread = threading.Thread(target=visualization_loop, args=(visualizer,))
+    vis_thread.daemon = True
+    vis_thread.start()
+    
+    try:
+        while running:
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        print("Main loop interrupted.")
+        running = False
+    
+    sensor_thread.join()
+    vis_thread.join()
+    print("Program exited cleanly")
